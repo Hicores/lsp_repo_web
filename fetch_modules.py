@@ -43,6 +43,27 @@ if TOKEN:
     HEADERS["Authorization"] = f"Bearer {TOKEN}"
 
 
+class SkipRepository(Exception):
+    """Raised when a repository cannot be read and should be skipped."""
+
+
+def response_message(resp: requests.Response) -> str:
+    try:
+        data = resp.json()
+    except ValueError:
+        return resp.text[:300]
+
+    message = data.get("message") or resp.reason
+    block = data.get("block")
+    if isinstance(block, dict):
+        reason = block.get("reason")
+        html_url = block.get("html_url")
+        details = ", ".join(str(item) for item in (reason, html_url) if item)
+        if details:
+            return f"{message} ({details})"
+    return str(message)
+
+
 def check_rate_limit(resp: requests.Response) -> None:
     """Sleep until rate limit resets if GitHub says the bucket is empty."""
     remaining = int(resp.headers.get("X-RateLimit-Remaining", 1))
@@ -66,6 +87,8 @@ def github_get(url: str, **params: Any) -> Any:
                 continue
         if resp.status_code == 404:
             return None
+        if resp.status_code == 451:
+            raise SkipRepository(response_message(resp))
         if resp.status_code >= 400:
             print(f"ERROR {resp.status_code} for {url}: {resp.text[:300]}")
             resp.raise_for_status()
@@ -106,17 +129,17 @@ def fetch_file_text(repo_name: str, filename: str) -> str:
     return base64.b64decode(encoded).decode("utf-8", errors="replace")
 
 
-def fetch_collaborators(repo_name: str) -> list[dict[str, str | None]]:
-    url = f"{API_ROOT}/repos/{ORG}/{repo_name}/collaborators"
+def fetch_contributors(repo_name: str) -> list[dict[str, str | None]]:
+    url = f"{API_ROOT}/repos/{ORG}/{repo_name}/contributors"
     resp = requests.get(
         url,
         headers=HEADERS,
-        params={"affiliation": "direct", "per_page": 100},
+        params={"per_page": 100},
         timeout=60,
     )
     check_rate_limit(resp)
-    if resp.status_code in (401, 403, 404):
-        print(f"  Collaborators unavailable for {repo_name}: HTTP {resp.status_code}")
+    if resp.status_code in (401, 403, 404, 451):
+        print(f"  Contributors unavailable for {repo_name}: HTTP {resp.status_code}")
         time.sleep(REQUEST_DELAY)
         return []
     if resp.status_code >= 400:
@@ -283,14 +306,18 @@ def build_module(repo: dict[str, Any], index: int, total: int) -> dict[str, Any]
         print(f"  Skipped: not a module-shaped repository.")
         return None
 
-    readme = fetch_file_text(name, "README.md")
-    summary_file = fetch_file_text(name, "SUMMARY").strip()
-    scope = parse_json_file(fetch_file_text(name, "SCOPE"))
-    source_url = trim_single_line(fetch_file_text(name, "SOURCE_URL"))
-    additional_authors = parse_json_file(fetch_file_text(name, "ADDITIONAL_AUTHORS"))
-    hide = bool(fetch_file_text(name, "HIDE"))
-    collaborators = fetch_collaborators(name)
-    raw_releases = [release for release in fetch_releases(name) if is_valid_release(release)]
+    try:
+        readme = fetch_file_text(name, "README.md")
+        summary_file = fetch_file_text(name, "SUMMARY").strip()
+        scope = parse_json_file(fetch_file_text(name, "SCOPE"))
+        source_url = trim_single_line(fetch_file_text(name, "SOURCE_URL"))
+        additional_authors = parse_json_file(fetch_file_text(name, "ADDITIONAL_AUTHORS"))
+        hide = bool(fetch_file_text(name, "HIDE"))
+        collaborators = fetch_contributors(name)
+        raw_releases = [release for release in fetch_releases(name) if is_valid_release(release)]
+    except SkipRepository as err:
+        print(f"  Skipped: repository unavailable ({err}).")
+        return None
 
     if not raw_releases:
         print("  Skipped: no published APK release with a valid tag.")
