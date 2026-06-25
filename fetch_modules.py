@@ -245,6 +245,7 @@ def release_object(release: dict[str, Any]) -> dict[str, Any]:
         "name": release.get("name") or release.get("tag_name"),
         "url": release.get("html_url"),
         "isDraft": release.get("draft", False),
+        "description": body,
         "descriptionHTML": convert_to_html(body),
         "createdAt": release.get("created_at"),
         "publishedAt": release.get("published_at"),
