@@ -4,9 +4,6 @@ Fetch module repositories from Xposed-Modules-Repo and publish the static API.
 The output mirrors the legacy Gatsby release layout:
   public/modules.json
   public/module/<package>.json
-
-For compatibility with the existing repository workflow, a copy of the module
-list is also written to ./modules.json.
 """
 
 from __future__ import annotations
@@ -24,7 +21,6 @@ import markdown
 import requests
 
 ORG = "Xposed-Modules-Repo"
-ROOT_MODULES_JSON = Path("modules.json")
 CACHE_DIR = Path(".cache")
 CACHE_FILE = CACHE_DIR / "fetch_modules_cache.json"
 CACHE_VERSION = 1
@@ -519,10 +515,8 @@ def write_outputs(modules: list[dict[str, Any]]) -> None:
 
     payload = json.dumps(public_modules, ensure_ascii=False, separators=(",", ":"))
     PUBLIC_MODULES_JSON.write_text(payload, encoding="utf-8")
-    ROOT_MODULES_JSON.write_text(json.dumps(public_modules, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Wrote {len(public_modules)} visible modules to {PUBLIC_MODULES_JSON}")
     print(f"Wrote {len(public_modules)} module detail files to {PUBLIC_MODULE_DIR}")
-    print(f"Wrote compatibility copy to {ROOT_MODULES_JSON}")
 
 
 def main() -> None:
