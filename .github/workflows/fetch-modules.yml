@@ -24,6 +24,13 @@ jobs:
           python-version: "3.11"
       - name: Install dependencies
         run: pip install requests markdown
+      - name: Restore module cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/fetch_modules_cache.json
+          key: modules-cache-${{ github.run_id }}
+          restore-keys: |
+            modules-cache-
       - name: Fetch modules
         run: python fetch_modules.py
         env:

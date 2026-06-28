@@ -11,7 +11,6 @@ list is also written to ./modules.json.
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import re
@@ -26,13 +25,26 @@ import requests
 
 ORG = "Xposed-Modules-Repo"
 ROOT_MODULES_JSON = Path("modules.json")
+CACHE_DIR = Path(".cache")
+CACHE_FILE = CACHE_DIR / "fetch_modules_cache.json"
+CACHE_VERSION = 1
 PUBLIC_DIR = Path("public")
 PUBLIC_MODULES_JSON = PUBLIC_DIR / "modules.json"
 PUBLIC_MODULE_DIR = PUBLIC_DIR / "module"
 PER_PAGE = 100
 REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "0.15"))
+CACHE_MAX_AGE_DAYS = float(os.environ.get("CACHE_MAX_AGE_DAYS", "7"))
+CACHE_MAX_AGE_SECONDS = CACHE_MAX_AGE_DAYS * 24 * 60 * 60
 API_ROOT = "https://api.github.com"
 APK_CONTENT_TYPE = "application/vnd.android.package-archive"
+MODULE_TEXT_FILES = (
+    "README.md",
+    "SUMMARY",
+    "SCOPE",
+    "SOURCE_URL",
+    "ADDITIONAL_AUTHORS",
+    "HIDE",
+)
 
 TOKEN = os.environ.get("GITHUB_TOKEN")
 HEADERS = {
@@ -119,14 +131,94 @@ def fetch_repos() -> list[dict[str, Any]]:
     return repos
 
 
-def fetch_file_text(repo_name: str, filename: str) -> str:
-    data = github_get(f"{API_ROOT}/repos/{ORG}/{repo_name}/contents/{filename}")
-    if not data or data.get("type") != "file":
-        return ""
-    encoded = data.get("content", "")
-    if not encoded:
-        return ""
-    return base64.b64decode(encoded).decode("utf-8", errors="replace")
+def load_module_cache() -> dict[str, dict[str, Any]]:
+    if not CACHE_FILE.exists():
+        print("No module cache found.")
+        return {}
+    try:
+        data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as err:
+        print(f"Could not read module cache: {err}")
+        return {}
+
+    if data.get("version") != CACHE_VERSION:
+        print("Ignoring module cache with incompatible version.")
+        return {}
+    modules = data.get("modules")
+    if not isinstance(modules, dict):
+        print("Ignoring malformed module cache.")
+        return {}
+    print(f"Loaded {len(modules)} cached repo entries.")
+    return modules
+
+
+def save_module_cache(modules: dict[str, dict[str, Any]]) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": CACHE_VERSION,
+        "savedAt": time.time(),
+        "modules": modules,
+    }
+    CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    print(f"Saved {len(modules)} repo entries to {CACHE_FILE}")
+
+
+def cache_entry_is_fresh(repo: dict[str, Any], entry: dict[str, Any] | None, now: float) -> bool:
+    if not entry:
+        return False
+    if entry.get("updatedAt") != repo.get("updated_at"):
+        return False
+    fetched_at = entry.get("fetchedAt")
+    if not isinstance(fetched_at, (int, float)):
+        return False
+    return CACHE_MAX_AGE_SECONDS < 0 or now - fetched_at <= CACHE_MAX_AGE_SECONDS
+
+
+def refresh_cached_repo_fields(module: dict[str, Any], repo: dict[str, Any]) -> dict[str, Any]:
+    refreshed = dict(module)
+    refreshed["description"] = repo.get("description") or ""
+    refreshed["url"] = repo.get("html_url")
+    refreshed["homepageUrl"] = repo.get("homepage") or ""
+    refreshed["updatedAt"] = repo.get("updated_at")
+    refreshed["createdAt"] = repo.get("created_at")
+    refreshed["stargazerCount"] = repo.get("stargazers_count")
+    return refreshed
+
+
+def fetch_repo_file_texts(repo_name: str, filenames: tuple[str, ...]) -> dict[str, str]:
+    """Fetch known root files without spending API calls on missing files."""
+    data = github_get(f"{API_ROOT}/repos/{ORG}/{repo_name}/contents")
+    if not isinstance(data, list):
+        return {filename: "" for filename in filenames}
+
+    wanted = set(filenames)
+    files_by_name = {
+        item.get("name"): item
+        for item in data
+        if item.get("type") == "file" and item.get("name") in wanted
+    }
+
+    texts: dict[str, str] = {}
+    for filename in filenames:
+        item = files_by_name.get(filename)
+        if not item:
+            texts[filename] = ""
+            continue
+        download_url = item.get("download_url")
+        if not download_url:
+            texts[filename] = ""
+            continue
+        resp = requests.get(download_url, timeout=60)
+        if resp.status_code == 404:
+            texts[filename] = ""
+            continue
+        if resp.status_code == 451:
+            raise SkipRepository(response_message(resp))
+        if resp.status_code >= 400:
+            print(f"ERROR {resp.status_code} for {download_url}: {resp.text[:300]}")
+            resp.raise_for_status()
+        texts[filename] = resp.content.decode("utf-8", errors="replace")
+    return texts
 
 
 def fetch_contributors(repo_name: str) -> list[dict[str, str | None]]:
@@ -234,6 +326,7 @@ def release_asset(asset: dict[str, Any]) -> dict[str, Any]:
         "name": asset.get("name"),
         "contentType": asset.get("content_type"),
         "downloadUrl": asset.get("browser_download_url"),
+        "originalDownloadUrl": asset.get("browser_download_url"),
         "downloadCount": asset.get("download_count"),
         "size": asset.get("size"),
     }
@@ -308,13 +401,6 @@ def build_module(repo: dict[str, Any], index: int, total: int) -> dict[str, Any]
         return None
 
     try:
-        readme = fetch_file_text(name, "README.md")
-        summary_file = fetch_file_text(name, "SUMMARY").strip()
-        scope = parse_json_file(fetch_file_text(name, "SCOPE"))
-        source_url = trim_single_line(fetch_file_text(name, "SOURCE_URL"))
-        additional_authors = parse_json_file(fetch_file_text(name, "ADDITIONAL_AUTHORS"))
-        hide = bool(fetch_file_text(name, "HIDE"))
-        collaborators = fetch_contributors(name)
         raw_releases = [release for release in fetch_releases(name) if is_valid_release(release)]
     except SkipRepository as err:
         print(f"  Skipped: repository unavailable ({err}).")
@@ -322,6 +408,19 @@ def build_module(repo: dict[str, Any], index: int, total: int) -> dict[str, Any]
 
     if not raw_releases:
         print("  Skipped: no published APK release with a valid tag.")
+        return None
+
+    try:
+        file_texts = fetch_repo_file_texts(name, MODULE_TEXT_FILES)
+        readme = file_texts["README.md"]
+        summary_file = file_texts["SUMMARY"].strip()
+        scope = parse_json_file(file_texts["SCOPE"])
+        source_url = trim_single_line(file_texts["SOURCE_URL"])
+        additional_authors = parse_json_file(file_texts["ADDITIONAL_AUTHORS"])
+        hide = bool(file_texts["HIDE"])
+        collaborators = fetch_contributors(name)
+    except SkipRepository as err:
+        print(f"  Skipped: repository unavailable ({err}).")
         return None
 
     releases = [release_object(release) for release in raw_releases]
@@ -432,13 +531,49 @@ def main() -> None:
         print("No repos found, aborting.")
         sys.exit(1)
 
+    cached_entries = load_module_cache()
+    next_cache_entries: dict[str, dict[str, Any]] = {}
+    now = time.time()
+    reused = 0
+    negative_reused = 0
+    rebuilt = 0
     modules: list[dict[str, Any]] = []
     for index, repo in enumerate(repos, 1):
+        name = repo["name"]
+        cached_entry = cached_entries.get(name)
+        if cache_entry_is_fresh(repo, cached_entry, now):
+            cached_module = cached_entry.get("module")
+            next_cache_entries[name] = cached_entry
+            if cached_module:
+                module = refresh_cached_repo_fields(cached_module, repo)
+                modules.append(module)
+                next_cache_entries[name] = {**cached_entry, "module": module}
+                reused += 1
+                print(f"[{index}/{len(repos)}] Reused cached {name}.")
+            else:
+                negative_reused += 1
+                print(f"[{index}/{len(repos)}] Reused cached skip for {name}.")
+            continue
+
         module = build_module(repo, index, len(repos))
         if module:
             modules.append(module)
+            next_cache_entries[name] = {
+                "updatedAt": repo.get("updated_at"),
+                "fetchedAt": now,
+                "module": module,
+            }
+            rebuilt += 1
+        elif not should_skip_repo(repo):
+            next_cache_entries[name] = {
+                "updatedAt": repo.get("updated_at"),
+                "fetchedAt": now,
+                "module": None,
+            }
 
     write_outputs(modules)
+    save_module_cache(next_cache_entries)
+    print(f"Cache summary: reused={reused}, reused skips={negative_reused}, rebuilt={rebuilt}")
 
 
 if __name__ == "__main__":
